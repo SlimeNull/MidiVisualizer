@@ -6,12 +6,15 @@ using System.Linq;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
 
 namespace Midi
 {
     [SupportedOSPlatform("windows6.1")]
     public class MidiVisualizer
     {
+        private record struct GeneratedFrame(int FrameIndex, Bitmap Frame);
+
         private readonly VisualizationConfig _config;
         private readonly MidiParser.MidiData _midiData;
         private readonly List<Note> _processedNotes;
@@ -43,11 +46,48 @@ namespace Midi
             {
                 using var brushes = new VisualizationBrushes(_config);
 
+                bool generationRunning = true;
+                ConcurrentQueue<GeneratedFrame> framesQueue = new ConcurrentQueue<GeneratedFrame>();
+
+                var saveFramesThread = new Thread(() =>
+                {
+                    while (framesQueue.Count > 0 || generationRunning)
+                    {
+                        if (!framesQueue.TryDequeue(out var generatedFrame))
+                        {
+                            continue;
+                        }
+
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            // 保存帧
+                            string framePath = Path.Combine(_outputDirectory, $"{generatedFrame.FrameIndex:0000}.png");
+                            generatedFrame.Frame.Save(framePath, ImageFormat.Png);
+                            generatedFrame.Frame.Dispose();
+                        });
+                    }
+                });
+
+                saveFramesThread.IsBackground = true;
+                saveFramesThread.Start();
+
                 for (int frameIndex = 0; frameIndex <= totalFrames; frameIndex++)
                 {
-                    GenerateFrame(frameIndex, brushes);
+                    while (framesQueue.Count > 200)
+                    {
+                        // 等待队列中的帧被处理
+                        Thread.Sleep(10);
+                    }
+
+                    var frame = GenerateFrame(frameIndex, brushes);
+
+                    framesQueue.Enqueue(new GeneratedFrame(frameIndex, frame));
+
                     UpdateProgress(frameIndex + 1, totalFrames);
                 }
+
+                generationRunning = false;
+                saveFramesThread.Join();
             }
             finally
             {
@@ -58,12 +98,12 @@ namespace Midi
             TryOpenOutputDirectory();
         }
 
-        private void GenerateFrame(int frameIndex, VisualizationBrushes brushes)
+        private Bitmap GenerateFrame(int frameIndex, VisualizationBrushes brushes)
         {
             double pixelsPerFrame = _config.PixelsPerSecond / _config.FramesPerSecond;
             int offsetX = (int)(pixelsPerFrame * frameIndex);
 
-            using var bitmap = new Bitmap(_config.CanvasWidth, _config.CanvasHeight);
+            var bitmap = new Bitmap(_config.CanvasWidth, _config.CanvasHeight);
             using var graphics = Graphics.FromImage(bitmap);
 
             // 绘制背景
@@ -75,9 +115,7 @@ namespace Midi
             // 绘制判定线
             DrawGuideline(graphics, brushes);
 
-            // 保存帧
-            string framePath = Path.Combine(_outputDirectory, $"{frameIndex:0000}.png");
-            bitmap.Save(framePath, ImageFormat.Png);
+            return bitmap;
         }
 
         private void DrawNotes(Graphics graphics, int offsetX, VisualizationBrushes brushes)
